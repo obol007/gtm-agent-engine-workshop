@@ -72,7 +72,7 @@ def save_profile_to_db(prospect_id, profile):
     _PROFILES[prospect_id] = profile
     return {"saved": True}
 
-def update_prospect_info(prospect_id, technology):
+def update_prospect_info(prospect_id, technology, rep):
     "Add a technology to a prospect's source-of-truth record."
     record = PROSPECTS.get(prospect_id)
     if record is None:
@@ -80,4 +80,11 @@ def update_prospect_info(prospect_id, technology):
     tech_stack = list(record["tech_stack"])
     if technology not in tech_stack:
         tech_stack.append(technology)
-    return {"updated": True, "found": True, "tech_stack": tech_stack}
+    record["tech_stack"] = tech_stack
+    record["last_updated_by"] = {
+        "rep_id": rep["rep_id"],
+        "name": rep["name"],
+        "email": rep["email"],
+    }
+    return {"updated": True, "found": True, "tech_stack": tech_stack,
+            "updated_by": record["last_updated_by"]}

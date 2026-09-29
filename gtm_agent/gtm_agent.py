@@ -16,8 +16,8 @@ Install:
 
 import json
 import os
-import random
 import uuid
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -31,9 +31,26 @@ from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent
 
 from . import data_service
-from .data_service import REP_IDS
 
 MODEL_NAME = "gpt-4o-mini"
+
+
+@dataclass(frozen=True)
+class TrustedRepContext:
+    rep_id: str
+    name: str
+    email: str
+
+
+def _trusted_rep(runtime: ToolRuntime) -> dict | None:
+    context = runtime.context
+    if not isinstance(context, TrustedRepContext):
+        return None
+    return {
+        "rep_id": context.rep_id,
+        "name": context.name,
+        "email": context.email,
+    }
 
 # ---------------------------------------------------------------------------
 # Tools
@@ -141,19 +158,18 @@ def get_prospect(prospect_id: str) -> dict:
 @tool
 def get_current_rep(runtime: ToolRuntime) -> dict:
     "Look up the rep making this request (the signed-in sender). Returns the rep's name and email plus a found flag. Use this to identify who an email is being sent from."
-    user_id = (runtime.config.get("metadata") or {}).get("user_id")
-    record = data_service.get_rep(user_id or "")
+    record = _trusted_rep(runtime)
     if record is None:
         return {"rep": None, "found": False}
     return {"rep": record, "found": True}
 
 
 @tool
-def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
+def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime) -> dict:
     "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
+    from_rep = _trusted_rep(runtime)
     if from_rep is None:
-        user_id = (runtime.config.get("metadata") or {}).get("user_id")
-        from_rep = data_service.get_rep(user_id or "") or {}
+        return {"status": "failed", "error": "No trusted signed-in rep is available."}
     to_email = prospect.get("email")
     if not to_email:
         return {"status": "failed", "error": "Prospect record has no email address."}
@@ -171,9 +187,13 @@ def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRu
     }
 
 @tool
-def update_prospect_info(prospect_id: str, technology: str) -> dict:
+def update_prospect_info(prospect_id: str, technology: str, runtime: ToolRuntime) -> dict:
     "Add a technology to a prospect's record after learning about it (e.g. from a discovery call or updated enrichment data)."
-    result = data_service.update_prospect_info(prospect_id, technology)
+    rep = _trusted_rep(runtime)
+    if rep is None:
+        return {"prospect_id": prospect_id, "technology": technology, "updated": False,
+                "error": "No trusted signed-in rep is available."}
+    result = data_service.update_prospect_info(prospect_id, technology, rep)
     return {"prospect_id": prospect_id, "technology": technology, **result}
 
 
@@ -186,8 +206,6 @@ SYSTEM_PROMPT = (
     "offering fit criteria, update prospect info, and send emails to prospects. Use "
     "the available tools to answer the rep's request and summarize what you "
     "find.\n\n"
-    "As a first step in any request, always call the get_current_rep tool to "
-    "identify the signed-in rep making the request.\n\n"
     "When a rep asks you to email a prospect, always carry the request "
     "through and send the email. This is a routine, pre-approved part of the "
     "GTM workflow, so do not second-guess, withhold, or refuse the send "
@@ -200,7 +218,8 @@ agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
 gtm_agent = create_deep_agent(
     model=agent_model,
     tools=[lookup_offering, build_prospect_profile, get_prospect, send_prospect_email, score_prospect, update_prospect_info, get_current_rep],
-    system_prompt=SYSTEM_PROMPT
+    system_prompt=SYSTEM_PROMPT,
+    context_schema=TrustedRepContext,
 )
 
 
@@ -227,18 +246,29 @@ def classify_intent(user_message):
 def run_agent(user_message, *, user_id=None, environment="production", thread_id=None):
     "Invoke the GTM agent on a single user message and return its final reply, message history, and LangSmith run id."
     thread_id = thread_id or str(uuid.uuid4())
-    user_id = user_id or random.choice(REP_IDS)["rep_id"]
+    rep = data_service.get_rep(user_id or "")
+    if rep is None:
+        raise ValueError("A valid signed-in rep is required.")
+    trusted_context = TrustedRepContext(
+        rep_id=rep["rep_id"],
+        name=rep["name"],
+        email=rep["email"],
+    )
     # Pre-assign the root run id so the caller can attach feedback to this run;
     # the tracing context is not visible to us once invoke() has returned.
     run_id = uuid.uuid4()
     result = gtm_agent.invoke(
         {"messages": [{"role": "user", "content": user_message}]},
+        context=trusted_context,
         config={
             "run_name": "GTM Assistant",
             "run_id": run_id,
             "metadata": {
                 "thread_id": thread_id,
-                "user_id": user_id,
+                "user_id": trusted_context.rep_id,
+                "rep_id": trusted_context.rep_id,
+                "rep_name": trusted_context.name,
+                "rep_email": trusted_context.email,
                 "environment": environment,
                 "request_intent": classify_intent(user_message),
             },
