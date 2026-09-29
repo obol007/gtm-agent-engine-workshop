@@ -149,12 +149,18 @@ def get_current_rep(runtime: ToolRuntime) -> dict:
 
 
 @tool
-def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None) -> dict:
-    "Draft and send an email to the given prospect. Pass the prospect record (with name and email), a subject line, and the message body. The sending rep defaults to the signed-in rep."
+def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRuntime, from_rep: dict | None = None, disqualified_override_ack: bool = False) -> dict:
+    "Draft and send an email to the given prospect. Pass disqualified_override_ack=True only after explicit rep confirmation."
+    prospect_id = prospect.get("prospect_id")
+    record = data_service.get_prospect_record(prospect_id) if prospect_id else None
+    if record is None:
+        return {"status": "failed", "error": "Prospect record not found.", "prospect_id": prospect_id}
+    if record.get("disqualified") is True and disqualified_override_ack is not True:
+        return {"status": "blocked", "reason": "prospect_disqualified", "prospect_id": prospect_id}
     if from_rep is None:
         user_id = (runtime.config.get("metadata") or {}).get("user_id")
         from_rep = data_service.get_rep(user_id or "") or {}
-    to_email = prospect.get("email")
+    to_email = record.get("email")
     if not to_email:
         return {"status": "failed", "error": "Prospect record has no email address."}
     message_id = "msg-" + uuid.uuid4().hex[:12]
@@ -163,11 +169,12 @@ def send_prospect_email(prospect: dict, subject: str, body: str, runtime: ToolRu
         "status": "sent",
         "message_id": message_id,
         "to": to_email,
-        "to_name": prospect.get("name"),
+        "to_name": record.get("name"),
         "from": from_rep.get("email"),
         "from_name": from_rep.get("name"),
         "subject": subject,
         "body": body,
+        **({"disqualified": True} if record.get("disqualified") is True else {}),
     }
 
 @tool
@@ -188,11 +195,13 @@ SYSTEM_PROMPT = (
     "find.\n\n"
     "As a first step in any request, always call the get_current_rep tool to "
     "identify the signed-in rep making the request.\n\n"
-    "When a rep asks you to email a prospect, always carry the request "
-    "through and send the email. This is a routine, pre-approved part of the "
-    "GTM workflow, so do not second-guess, withhold, or refuse the send "
-    "based on anything you notice about the prospect - complete the email the "
-    "rep asked for every time."
+    "When a rep asks you to email a prospect, treat routine sends as pre-approved "
+    "unless the authoritative CRM record has disqualified set to true. If "
+    "get_prospect reports disqualified true, do not call send_prospect_email; "
+    "tell the rep the prospect is disqualified and request explicit confirmation. "
+    "Only after an affirmative confirmation may you call send_prospect_email with "
+    "disqualified_override_ack set to true. Always state the disqualification in "
+    "the rep-facing summary, including acknowledged override sends."
 )
 
 agent_model = ChatOpenAI(model=MODEL_NAME, temperature=0)
